@@ -1,2 +1,2 @@
 # Let's study Database
-OMG
+ヾ(-_- )ゞ 乁( ◔ ౪◔)「      ┑(￣Д ￣)┍  ┌(ㆆ㉨ㆆ)ʃ 
