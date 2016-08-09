@@ -1,0 +1,146 @@
+## 인덱스 활용
+
+### 북마크 룩업 최소화
+북마크 룩업이란?
+  - 인덱스 RID ──액세스──> 테이블 row  (Non-clustered)
+  - 인덱스 KEY ──액세스──> 테이블 row  (Clustered)
+
+액세스 방식
+  - Random Access
+
+방법 (How to)
+  * 인덱스에 검색 조건에 필요한 컬럼을 추가 / 검색 대상 줄이기. 쿼리 종류가 다양하므로 비현실적
+  * Clustered로 바꾸기 / RID lookup이 과도한 경우 이를 없앨 수 있음(리프 = 데이터). 단점은 테이블당 하나로 제한되는 것.
+  * Covered index / 쿼리 내의 컬럼을 모두 포함. Clustered + Non-clustered는 RID lookup보다 I/O 증가.
+
+---
+### 인덱스 탐색 효율
+
+#### 선행 컬럼에 WHERE ... BETWEEN 검색
+
+| OrderDate | EmplyeeID |
+| ----------|-----------|
+| 1998-02-25 00:00:00.000 | 1008 |
+| ↓ `1998-02-26 00:00:00.000` | `1` |
+| ↓ `1998-02-26 00:00:00.000` | `1` |
+| ↓ `1998-02-26 00:00:00.000` | 2 |
+| ↓ `1998-02-26 00:00:00.000` | 3 |
+| ↓ `...` | ... |
+| ↓ `...` | ... |
+| ↓ `1998-02-26 00:00:00.000` | 1008 |
+| ↓ `1998-02-27 00:00:00.000` | `1` |
+| ↓ `1998-02-27 00:00:00.000` | 2 |
+| 1998-02-27 00:00:00.000 | 6 |
+
+#### 선행 컬럼에 WHERE ... IN 검색
+
+| OrderDate | EmplyeeID |
+| ----------|-----------|
+| 1998-02-25 00:00:00.000 | 1008 |
+| ↓ `1998-02-26 00:00:00.000` | `1` |
+| ↓ `1998-02-26 00:00:00.000` | `1` |
+| ↓ `1998-02-26 00:00:00.000` | 2 |
+| 1998-02-26 00:00:00.000 | 3 |
+| ... | ... |
+| ... | ... |
+| 1998-02-26 00:00:00.000 | 1008 |
+| ↓ `1998-02-27 00:00:00.000` | `1` |
+| ↓ `1998-02-27 00:00:00.000` | 2 |
+| 1998-02-27 00:00:00.000 | 6 |
+
+__북마크 룩업__ 시 인덱스에 컬럼 추가로 해결할 수 _없는_ 문제 (I/O만 늘어남)
+
+원인: _인덱스 탐색_ 과정에서 문제 발생
+
+방법(How to)
+  1. 모든 컬럼에 equal 조건
+  2. 선행 컬럼에 between 조건 / 선행 컬럼 스캔 이후 후행 컬럼에서 걸러냄
+  3. in-list(WHERE IN ...)를 활용해 between 조건 향상 (표 예시 참고)
+    - between 탐색 조건 예 / 고정 데이터 < 고정 컬럼 < 고정 데이터
+    - 실행 계획
+      ```
+      Clustered Index Seek(...)
+      SEEK: ...
+      AND (고정 데이터 < [주문 일자]),
+      AND ([주문 일자] < 고정 데이터) ORDERED FORWARD
+      ```
+
+      왼쪽 부등식과 오른쪽 부등식 결과의 교집합.
+    - between의 단점: 선행 조건의 vertical 탐색 범위가 넓음 ⇒ 전체 탐색 범위 늘어남
+    - Legacy system에서는 인덱스를 2.와 같이 맞추는 것이 어려움
+    - in-list: vertical 탐색 범위를 확 줄임 ⇒ 전체 탐색 범위 줄임
+    - _in-list/between 사용 시 검색 범위가 일치할 때 ⇒ in-list가 비효율적!_
+  4. 선분 이력의 인덱스 탐색 효율
+    - '시작일 ~ 만료일'처럼 이루어진 컬럼(2개) / '주문 일자(:점 이력)'와 다름
+    - between 탐색 조건 예 / 컬럼A < 고정 데이터 < 컬럼B
+    - 실행 계획 / **인덱스 선언 시, 컬럼 순서가 속도를 좌우한다.**
+      ```
+      Clustered Index Seek(...)
+      SEEK: ... AND ([시작 일자] < 고정 데이터),
+      WHERE: (고정 데이터 < [만료 일자]) ORDERED FORWARD
+
+      ([시작 일자] < 고정 데이터) 에서 WHERE릍 통해 row를 모두 따짐. 집합이 크면 Table Scan과 동급이 됨.
+      ([시작 일자] < 고정 데이터) 개수가 적어진다면(i.e. 과거 이력 조회) 유리.
+      ```
+      ```
+      Clustered Index Seek(...)
+      SEEK: ... AND ([만료 일자] > 고정 데이터),
+      WHERE: (고정 데이터 > [시작 일자]) ORDERED FORWARD
+
+      ([만료 일자] > 고정 데이터) 에서 WHERE릍 통해 row를 모두 따짐. 집합이 크면 Table Scan과 동급이 됨. /
+      ([만료 일자] > 고정 데이터) 개수가 적어진다면(i.e. 최근 이력 조회) 유리.
+      ```
+    - 만약, 중간 범위 조회가 많다면? / TOP-N 쿼리를 쓰자.
+      ```
+      현재 시점이 유효기간 내인지 알고 싶을 때
+
+      SELECT TOP 1 *
+      FROM memberModified
+      WHERE memberId = '001'
+      AND '19800501' BETWEEN startDate AND endDate
+      ORDER BY endDate, startDate
+      GO
+
+      과거/최근 이력 보기에도 사용 가능!
+      ```
+
+결론(선분 이력)
+
+| 검색 유형 | startDate → endDate | endDate → startDate |
+| :---: | :---: | :---: |
+| 과거 데이터 조회 시 | 유리 | 불리. 단, _TOP 1 ... ORDER BY endDate/startDate **ASC**_로 개선 가능 |
+| 중간 데이터 조회 시 | 불리. 단, _TOP 1 ... ORDER BY endDate/startDate **DESC**_로 개선 가능 | 불리. 단, _TOP 1 ... ORDER BY endDate/startDate **ASC**_로 개선 가능 |
+| 최근 데이터 조회 시 | 불리. 단, _TOP 1 ... ORDER BY endDate/startDate **DESC**_로 개선 가능 | 유리. **일반적으로, 이 경우에 맞추는 게 성능 상 유리함** |
+
+---
+### 인덱스 설계
+
+#### 문제
+검색 조건 변경 없이 속도를 빠르게 하고 싶다. 인덱스를 어떻게 바꿔야 할까?
+```
+<인덱스 현황>
+product_x01 = date, productType, productSubtype
+product_x02 = date, productPriceLevel, marketerId
+product_x03 = date, marketerId, productType, productSubtype
+
+<검색 조건>
+① WHERE date >= @p1 AND productType = @p2 AND productSubtype = @p3
+② WHERE marketerId = @p1 AND date >= @p2
+③ WHERE productType = @p1 AND productSubtype = @p2
+④ WHERE date = @p1 AND marketerId = @p2 AND productPriceLevel BETWEEN @p3 AND @p4
+```
+
+```
+<모범 답안>
+③는 date를 아예 안 쓰므로 인덱스 사용 불가
+
+product_x01 =
+productType + productSubtype + date
+
+product_x02 =
+marketerId + date + productPriceLevel
+
+product_x03 = 노답. 삭제.
+```
+---
+End of chapter.
